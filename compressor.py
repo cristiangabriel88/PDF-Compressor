@@ -180,7 +180,7 @@ def compress_pdf(input_path, output_path, target_bytes=None,
     tmpdir = tempfile.mkdtemp(prefix="pdfcomp_")
     try:
         # --- Step 1: lossless optimization -----------------------------------
-        report("Optimizare fără pierderi...")
+        report("Lossless optimization...")
         best_path, best_size, best_method = input_path, original, "copy"
         for idx, fn in enumerate((_lossless_pikepdf, _lossless_mupdf)):
             tmp = os.path.join(tmpdir, f"lossless_{idx}.pdf")
@@ -205,7 +205,7 @@ def compress_pdf(input_path, output_path, target_bytes=None,
         grid = [(d, q) for (d, q) in SEARCH_GRID
                 if d >= min_dpi and q >= min_jpeg_quality]
         for dpi, quality in grid:
-            report(f"Recomprimare imagini la {dpi} DPI, calitate {quality}...")
+            report(f"Recompressing images at {dpi} DPI, quality {quality}...")
             tmp = os.path.join(tmpdir, f"img_{dpi}_{quality}.pdf")
             try:
                 _recompress_images(input_path, tmp, dpi, quality)

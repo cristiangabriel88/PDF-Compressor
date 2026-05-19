@@ -1,42 +1,91 @@
 # PDF Compressor
 
-A small Windows desktop app that shrinks PDF files toward a target size while
-keeping them printable. Text and vector graphics are never rasterized — only
-embedded raster images are downsampled / re-encoded, and never below a
-print-safe DPI floor.
+A desktop application for compressing PDF files without rasterizing text or vector content. Drag and drop one or more PDFs, click **Compress**, and receive smaller copies written alongside the originals — the source files are never touched.
+
+Available in **English** and **Romanian** (switchable at runtime from the language selector in the top bar).
+
+---
 
 ## Features
 
-- Drag and drop PDFs into a table (name, path, current size).
-- Per-file editable **Target (KB)** column — double-click the cell to set it.
-- One big **COMPRESS** button.
-- Compressed copies are saved next to the originals as `<name>_compressed.pdf`.
-  The original files are never modified.
-- If a target can't be reached without dropping below print quality, the app
-  keeps the smallest safe result and marks the row as *Best effort*.
+- **Drag-and-drop** or click-to-browse file loading
+- **Lossless pass** first — stream re-compression via pikepdf + MuPDF garbage collection
+- **Image recompression** — embedded rasters are downsampled and JPEG-encoded at progressively lower DPI/quality until size stops improving, while staying within a print-safe floor (150 DPI / quality 60)
+- Text and vector art are **never rasterized**
+- Transparent/alpha images are left untouched to avoid artefacts
+- **Custom output folder** — or save next to each original (default)
+- **Multi-file queue** with per-file status, input/output sizes, and a progress bar
+- Elapsed time shown during compression
+- EN / RO language selector in the header bar
+- Light theme (Sun Valley TTK)
 
-## How compression works
+---
 
-1. **Lossless pass** — stream/object optimization and garbage collection
-   (`pikepdf` + `PyMuPDF`). If that already meets the target, it stops here.
-2. **Image recompression** — if still too big, embedded images are downsampled
-   and re-encoded as JPEG, trying progressively more aggressive settings
-   (300 DPI down to a 150 DPI / quality-60 floor) until the target is met.
-3. **Best effort** — if even the floor settings don't reach the target, the
-   smallest valid result is kept and the row is flagged.
+## Requirements
 
-## Run from source
+- Python 3.10+
+- Dependencies listed in `requirements.txt`:
 
-```bat
+```
+PyMuPDF>=1.23
+pikepdf>=8
+Pillow>=10
+tkinterdnd2>=0.4
+sv-ttk>=2.6
+pyinstaller>=6   # only needed to build the .exe
+```
+
+Install with:
+
+```bash
 pip install -r requirements.txt
+```
+
+---
+
+## Running from source
+
+```bash
 python main.py
 ```
 
-## Build the .exe
+Or double-click `run.bat` on Windows.
 
-```bat
-build.bat
+---
+
+## Building a standalone executable
+
+Run `build.bat` (Windows) or invoke PyInstaller directly:
+
+```bash
+python -m PyInstaller PDFCompressor.spec --noconfirm
 ```
 
-This produces a single self-contained `dist\PDFCompressor.exe` that runs on any
-Windows PC with no Python install required.
+The output is placed in `dist\PDFCompressor\`. To distribute, zip the entire `dist\PDFCompressor\` folder.
+
+---
+
+## How compression works
+
+1. **Lossless optimisation** — the PDF is saved twice (once with pikepdf, once with MuPDF) with stream recompression and cross-reference/object-stream compaction. The smaller result is kept.
+2. **Image recompression** — embedded raster images larger than 30 KB are downsampled to the DPI they are actually displayed at (so a 600 DPI scan shown at 150 DPI points is downsampled to 150 DPI) and re-encoded as JPEG. Seven DPI/quality combinations are tried from gentlest to most aggressive; the smallest result that stays above the print-safe floor is kept.
+3. The smallest output from all passes is written to disk. The original is never modified.
+
+---
+
+## Project structure
+
+| File | Purpose |
+|------|---------|
+| `main.py` | Tkinter UI, drag-and-drop, language switching |
+| `compressor.py` | Pure compression engine (no UI dependency) |
+| `PDFCompressor.spec` | PyInstaller build spec |
+| `build.bat` | One-click build script |
+| `run.bat` | One-click run-from-source script |
+| `icon.ico` / `icon.png` | Application icon |
+
+---
+
+## License
+
+2026
