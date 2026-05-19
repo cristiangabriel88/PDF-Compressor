@@ -10,7 +10,7 @@ from tkinter import ttk, messagebox, filedialog
 import sv_ttk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from compressor import compress_pdf
+from compressor import compress_pdf, CompressionAborted
 
 COLUMNS = ("name", "path", "current", "result", "status")
 
@@ -35,6 +35,8 @@ STRINGS = {
         "btn_output_dir": "Output folder…",
         "btn_compress": "Compress",
         "btn_compressing": "Compressing…",
+        "btn_stop": "Stop",
+        "btn_stopping": "Stopping…",
         "col_name": "Name",
         "col_path": "Path",
         "col_current": "Current size",
@@ -52,12 +54,14 @@ STRINGS = {
         "step_progress": "{name}  ({idx}/{total})  —  {msg}",
         "waiting": "Waiting",
         "compressing": "Compressing…",
+        "stopped": "Stopped",
         "done_result": "Done  —  {msg}",
         "error_result": "Error: {msg}",
         "total_time": "Total time: {t}",
         "done_1": "Done  —  1 file compressed",
         "done_n": "Done  —  {total} files compressed",
         "done_errors": "Done  —  {ok} succeeded, {errors} errors out of {total}",
+        "done_stopped": "Stopped  —  {done}/{total} compressed",
         "add_files_first": "Add PDF files first.",
         "select_pdf": "Select PDF files",
         "pdf_files": "PDF Files",
@@ -65,6 +69,7 @@ STRINGS = {
         "choose_output": "Choose where to save compressed PDF files",
         "lang_label": "Language:",
         "msg_lossless": "Lossless optimization...",
+        "msg_analyzing": "Analyzing images...",
         "msg_recompress": "Recompressing images at {dpi} DPI, quality {quality}...",
     },
     "ro": {
@@ -77,6 +82,8 @@ STRINGS = {
         "btn_output_dir": "Folder destinație…",
         "btn_compress": "Comprimare",
         "btn_compressing": "Se comprimă…",
+        "btn_stop": "Oprește",
+        "btn_stopping": "Se oprește…",
         "col_name": "Nume",
         "col_path": "Cale",
         "col_current": "Dimensiune actuală",
@@ -94,12 +101,14 @@ STRINGS = {
         "step_progress": "{name}  ({idx}/{total})  —  {msg}",
         "waiting": "În așteptare",
         "compressing": "Se comprimă…",
+        "stopped": "Oprit",
         "done_result": "Gata  —  {msg}",
         "error_result": "Eroare: {msg}",
         "total_time": "Timp total: {t}",
         "done_1": "Gata  —  1 fișier comprimat",
         "done_n": "Gata  —  {total} fișiere comprimate",
         "done_errors": "Gata  —  {ok} reușite, {errors} cu erori din {total}",
+        "done_stopped": "Oprit  —  {done}/{total} comprimate",
         "add_files_first": "Adăugați mai întâi fișiere PDF.",
         "select_pdf": "Selectați fișiere PDF",
         "pdf_files": "Fișiere PDF",
@@ -107,6 +116,7 @@ STRINGS = {
         "choose_output": "Alegeți unde să salvați fișierele PDF comprimate",
         "lang_label": "Limbă:",
         "msg_lossless": "Optimizare fără pierderi...",
+        "msg_analyzing": "Analizare imagini...",
         "msg_recompress": "Recomprimare imagini la {dpi} DPI, calitate {quality}...",
     },
 }
@@ -120,6 +130,7 @@ COL_WIDTHS = {
 }
 
 _COMPRESSOR_LOSSLESS_MSG = "Lossless optimization..."
+_COMPRESSOR_ANALYZING_MSG = "Analyzing images..."
 _COMPRESSOR_RECOMPRESS_PREFIX = "Recompressing images at "
 
 
@@ -158,6 +169,7 @@ class PdfCompressorApp:
         self.root = root
         self.rows = {}  # item_id -> {"path", "size", "status_key", "result_msg", "error_msg"}
         self.compressing = False
+        self.stop_requested = False
         self.output_dir = None  # None -> save next to each original
         self.start_time = None
         self.lang = "en"
@@ -193,6 +205,8 @@ class PdfCompressorApp:
             return msg
         if msg == _COMPRESSOR_LOSSLESS_MSG:
             return self._t("msg_lossless")
+        if msg == _COMPRESSOR_ANALYZING_MSG:
+            return self._t("msg_analyzing")
         if msg.startswith(_COMPRESSOR_RECOMPRESS_PREFIX):
             rest = msg[len(_COMPRESSOR_RECOMPRESS_PREFIX):]
             dpi_part, qual_part = rest.split(", quality ")
@@ -324,7 +338,7 @@ class PdfCompressorApp:
 
         self.compress_btn = ttk.Button(
             bar, text=self._t("btn_compress"), style="Big.Accent.TButton",
-            command=self._start_compression,
+            command=self._on_compress_button,
         )
         self.compress_btn.pack(side="right")
 
@@ -363,16 +377,21 @@ class PdfCompressorApp:
         self.btn_output_dir.config(text=self._t("btn_output_dir"))
         self._update_output_label()
         self._update_footer()
-        if self.compressing:
-            self.compress_btn.config(text=self._t("btn_compressing"))
-        else:
-            self.compress_btn.config(text=self._t("btn_compress"))
+        self._update_compress_btn()
         for col in COLUMNS:
             self.tree.heading(col, text=self._t(f"col_{col}"))
         self._retranslate_rows()
 
+    def _update_compress_btn(self):
+        if not self.compressing:
+            self.compress_btn.config(state="normal", text=self._t("btn_compress"))
+        elif self.stop_requested:
+            self.compress_btn.config(state="disabled", text=self._t("btn_stopping"))
+        else:
+            self.compress_btn.config(state="normal", text=self._t("btn_stop"))
+
     def _retranslate_rows(self):
-        static_keys = {"ready", "waiting", "compressing"}
+        static_keys = {"ready", "waiting", "compressing", "stopped"}
         for item, data in self.rows.items():
             sk = data.get("status_key", "ready")
             if sk in static_keys:
@@ -556,6 +575,18 @@ class PdfCompressorApp:
     def _ui(self, fn, *args):
         self.root.after(0, lambda: fn(*args))
 
+    def _on_compress_button(self):
+        if self.compressing:
+            self._request_stop()
+        else:
+            self._start_compression()
+
+    def _request_stop(self):
+        if not self.compressing or self.stop_requested:
+            return
+        self.stop_requested = True
+        self._update_compress_btn()
+
     def _start_compression(self):
         if self.compressing:
             return
@@ -563,8 +594,9 @@ class PdfCompressorApp:
             messagebox.showinfo(self._t("app_title"), self._t("add_files_first"))
             return
         self.compressing = True
+        self.stop_requested = False
         self.start_time = time.monotonic()
-        self.compress_btn.config(state="disabled", text=self._t("btn_compressing"))
+        self._update_compress_btn()
         total = len(self.rows)
         self.progress.config(maximum=total, value=0)
         self.progress_label.config(text=self._t("preparing", total=total))
@@ -582,7 +614,11 @@ class PdfCompressorApp:
     def _worker(self, snapshot, out_dir):
         total = len(snapshot)
         errors = 0
+        stopped = False
         for idx, (item, data) in enumerate(snapshot, start=1):
+            if self.stop_requested:
+                stopped = True
+                break
             name = os.path.basename(data["path"])
             self._ui(self._set_cell, item, "status", self._t("compressing"))
             self._ui(self._set_row_meta, item, status_key="compressing")
@@ -598,14 +634,22 @@ class PdfCompressorApp:
 
             try:
                 out_path = unique_output_path(data["path"], out_dir)
-                result = compress_pdf(data["path"], out_path,
-                                      progress_cb=progress)
+                result = compress_pdf(
+                    data["path"], out_path,
+                    progress_cb=progress,
+                    should_stop=lambda: self.stop_requested,
+                )
                 self._ui(self._apply_result, item, result)
+            except CompressionAborted:
+                stopped = True
+                self._ui(self._apply_stopped, item)
             except Exception as exc:  # noqa: BLE001
                 errors += 1
                 self._ui(self._apply_error, item, str(exc))
             self._ui(self._progress_finish_file, idx)
-        self._ui(self._finish_compression, total, errors)
+            if stopped:
+                break
+        self._ui(self._finish_compression, total, errors, stopped)
 
     def _apply_result(self, item, result):
         if item not in self.rows:
@@ -625,14 +669,28 @@ class PdfCompressorApp:
         self.rows[item]["error_msg"] = message
         self._set_status_tag(item, "error")
 
-    def _finish_compression(self, total=0, errors=0):
+    def _apply_stopped(self, item):
+        if item not in self.rows:
+            return
+        self._set_cell(item, "result", "—")
+        self._set_cell(item, "status", self._t("stopped"))
+        self.rows[item]["status_key"] = "stopped"
+        self._set_status_tag(item, None)
+
+    def _finish_compression(self, total=0, errors=0, stopped=False):
         self.compressing = False
-        self.compress_btn.config(state="normal", text=self._t("btn_compress"))
+        self.stop_requested = False
+        self._update_compress_btn()
         self.progress["value"] = self.progress["maximum"]
         if self.start_time is not None:
             elapsed = time.monotonic() - self.start_time
             self.time_label.config(text=self._t("total_time", t=fmt_duration(elapsed)))
-        if errors:
+        if stopped:
+            done = sum(1 for r in self.rows.values()
+                       if r.get("status_key") == "done")
+            self.progress_label.config(
+                text=self._t("done_stopped", done=done, total=total))
+        elif errors:
             ok = total - errors
             self.progress_label.config(
                 text=self._t("done_errors", ok=ok, errors=errors, total=total))

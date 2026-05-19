@@ -35,6 +35,10 @@ SEARCH_GRID = [
 MIN_IMAGE_BYTES = 30 * 1024
 
 
+class CompressionAborted(Exception):
+    """Raised when ``should_stop`` returns truthy mid-compression."""
+
+
 @dataclass
 class CompressResult:
     output_path: str
@@ -42,6 +46,17 @@ class CompressResult:
     target_met: bool
     method: str  # "lossless" | "image-recompress" | "best-effort" | "copy"
     message: str
+
+
+@dataclass
+class _ImageCandidate:
+    xref: int
+    pil: Image.Image  # decoded once, reused for every grid pass
+    src_w: int
+    src_h: int
+    disp_w: float
+    disp_h: float
+    original_bytes: int
 
 
 def _kb(n):
@@ -58,20 +73,24 @@ def _finalize(src, dst):
 
 
 def _lossless_pikepdf(src, dst):
+    # recompress_flate=True forces every flate stream to be decompressed
+    # and re-deflated at max effort -- the main source of slowness on PDFs
+    # with many small streams. Skipping it loses only marginal size.
     with pikepdf.open(src) as pdf:
         pdf.save(
             dst,
             compress_streams=True,
-            recompress_flate=True,
             object_stream_mode=pikepdf.ObjectStreamMode.generate,
             linearize=False,
         )
 
 
 def _lossless_mupdf(src, dst):
+    # clean=True re-parses every page's content stream and was the slow
+    # path on content-heavy PDFs; deflate + garbage gets most of the win.
     doc = fitz.open(src)
     try:
-        doc.save(dst, garbage=4, deflate=True, clean=True)
+        doc.save(dst, garbage=4, deflate=True)
     finally:
         doc.close()
 
@@ -92,8 +111,13 @@ def _xref_max_display_size(doc):
     return sizes
 
 
-def _recompress_images(src, dst, dpi, quality):
-    """Downsample/re-encode raster images, then save with garbage collection."""
+def _scan_image_candidates(src):
+    """One-time scan: identify and decode every eligible image.
+
+    The decoded PIL bitmaps are reused for each grid pass, which avoids
+    re-extracting and re-decoding the same images 7 times.
+    """
+    candidates = []
     doc = fitz.open(src)
     try:
         display = _xref_max_display_size(doc)
@@ -106,7 +130,6 @@ def _recompress_images(src, dst, dpi, quality):
                 seen.add(xref)
                 if smask != 0:
                     continue  # soft-masked / transparent -- leave alone
-
                 try:
                     info = doc.extract_image(xref)
                 except Exception:
@@ -114,7 +137,6 @@ def _recompress_images(src, dst, dpi, quality):
                 raw = info.get("image")
                 if not raw or len(raw) < MIN_IMAGE_BYTES:
                     continue
-
                 try:
                     pil = Image.open(io.BytesIO(raw))
                     pil.load()
@@ -124,50 +146,85 @@ def _recompress_images(src, dst, dpi, quality):
                     continue
                 if pil.mode == "P" and "transparency" in pil.info:
                     continue
-
-                src_w, src_h = pil.width, pil.height
-                disp = display.get(xref)
-                if disp and disp[0] > 0 and disp[1] > 0:
-                    max_w = max(1, int(dpi * disp[0] / 72.0))
-                    max_h = max(1, int(dpi * disp[1] / 72.0))
-                else:
-                    max_w, max_h = src_w, src_h
-                new_w, new_h = min(src_w, max_w), min(src_h, max_h)
-
                 if pil.mode not in ("RGB", "L"):
                     try:
                         pil = pil.convert("RGB")
                     except Exception:
                         continue
-                if (new_w, new_h) != (src_w, src_h):
+                disp = display.get(xref, (0.0, 0.0))
+                candidates.append(_ImageCandidate(
+                    xref=xref, pil=pil,
+                    src_w=pil.width, src_h=pil.height,
+                    disp_w=disp[0], disp_h=disp[1],
+                    original_bytes=len(raw),
+                ))
+    finally:
+        doc.close()
+    return candidates
+
+
+def _recompress_with_candidates(src, dst, candidates_by_xref, dpi, quality):
+    """Re-encode cached candidates at given dpi/quality, then save the doc.
+
+    Uses ``garbage=3, deflate=True`` (no ``clean=True``) for the intermediate
+    save -- ``clean=True`` re-parses every page's content stream which is the
+    main reason the old per-pass implementation was slow.
+    """
+    doc = fitz.open(src)
+    try:
+        seen = set()
+        for page in doc:
+            for img in page.get_images(full=True):
+                xref = img[0]
+                if xref in seen:
+                    continue
+                seen.add(xref)
+                c = candidates_by_xref.get(xref)
+                if c is None:
+                    continue
+
+                if c.disp_w > 0 and c.disp_h > 0:
+                    max_w = max(1, int(dpi * c.disp_w / 72.0))
+                    max_h = max(1, int(dpi * c.disp_h / 72.0))
+                else:
+                    max_w, max_h = c.src_w, c.src_h
+                new_w, new_h = min(c.src_w, max_w), min(c.src_h, max_h)
+
+                pil = c.pil
+                if (new_w, new_h) != (pil.width, pil.height):
                     pil = pil.resize((new_w, new_h), _RESAMPLE)
 
                 buf = io.BytesIO()
                 try:
-                    pil.save(buf, format="JPEG", quality=quality, optimize=True)
+                    pil.save(buf, format="JPEG", quality=quality)
                 except Exception:
                     continue
                 new_bytes = buf.getvalue()
-                if len(new_bytes) >= len(raw):
-                    continue  # recompression didn't help this image
+                if len(new_bytes) >= c.original_bytes:
+                    continue
 
                 try:
                     page.replace_image(xref, stream=new_bytes)
                 except Exception:
                     continue
 
-        doc.save(dst, garbage=4, deflate=True, clean=True)
+        doc.save(dst, garbage=3, deflate=True)
     finally:
         doc.close()
 
 
 def compress_pdf(input_path, output_path, target_bytes=None,
-                 min_dpi=150, min_jpeg_quality=60, progress_cb=None):
+                 min_dpi=150, min_jpeg_quality=60, progress_cb=None,
+                 should_stop=None):
     """Compress ``input_path``, writing ``output_path``.
 
     If ``target_bytes`` is given, compression stops as soon as the file is at
     or below it. If ``target_bytes`` is ``None``, the file is compressed as
     much as possible while staying within the print-safe quality floor.
+
+    ``should_stop`` may be a callable returning truthy to request an early
+    abort. It is polled at phase boundaries; on abort, :class:`CompressionAborted`
+    is raised and no output is written.
 
     Returns a :class:`CompressResult`. The original file is never modified.
     """
@@ -175,14 +232,20 @@ def compress_pdf(input_path, output_path, target_bytes=None,
         if progress_cb:
             progress_cb(msg)
 
+    def check_stop():
+        if should_stop and should_stop():
+            raise CompressionAborted()
+
     maximal = target_bytes is None
     original = _size(input_path)
     tmpdir = tempfile.mkdtemp(prefix="pdfcomp_")
     try:
         # --- Step 1: lossless optimization -----------------------------------
+        check_stop()
         report("Lossless optimization...")
         best_path, best_size, best_method = input_path, original, "copy"
         for idx, fn in enumerate((_lossless_pikepdf, _lossless_mupdf)):
+            check_stop()
             tmp = os.path.join(tmpdir, f"lossless_{idx}.pdf")
             try:
                 fn(input_path, tmp)
@@ -201,28 +264,44 @@ def compress_pdf(input_path, output_path, target_bytes=None,
                 f"{_kb(original)} → {_kb(final)}",
             )
 
-        # --- Step 2: iterative image recompression ---------------------------
-        grid = [(d, q) for (d, q) in SEARCH_GRID
-                if d >= min_dpi and q >= min_jpeg_quality]
-        for dpi, quality in grid:
-            report(f"Recompressing images at {dpi} DPI, quality {quality}...")
-            tmp = os.path.join(tmpdir, f"img_{dpi}_{quality}.pdf")
-            try:
-                _recompress_images(input_path, tmp, dpi, quality)
-            except Exception:
-                continue
-            if not os.path.exists(tmp):
-                continue
-            s = _size(tmp)
-            if s < best_size:
-                best_path, best_size, best_method = tmp, s, "image-recompress"
-            if not maximal and s <= target_bytes:
-                _finalize(best_path, output_path)
-                final = _size(output_path)
-                return CompressResult(
-                    output_path, final, True, "image-recompress",
-                    f"{_kb(original)} → {_kb(final)}",
-                )
+        # --- Step 2: pre-scan, then iterative image recompression -----------
+        check_stop()
+        report("Analyzing images...")
+        try:
+            candidates = _scan_image_candidates(input_path)
+        except Exception:
+            candidates = []
+
+        if candidates:
+            candidates_by_xref = {c.xref: c for c in candidates}
+            grid = [(d, q) for (d, q) in SEARCH_GRID
+                    if d >= min_dpi and q >= min_jpeg_quality]
+            prev_size = None
+            for dpi, quality in grid:
+                check_stop()
+                report(f"Recompressing images at {dpi} DPI, quality {quality}...")
+                tmp = os.path.join(tmpdir, f"img_{dpi}_{quality}.pdf")
+                try:
+                    _recompress_with_candidates(
+                        input_path, tmp, candidates_by_xref, dpi, quality)
+                except Exception:
+                    continue
+                if not os.path.exists(tmp):
+                    continue
+                s = _size(tmp)
+                if s < best_size:
+                    best_path, best_size, best_method = tmp, s, "image-recompress"
+                if not maximal and s <= target_bytes:
+                    _finalize(best_path, output_path)
+                    final = _size(output_path)
+                    return CompressResult(
+                        output_path, final, True, "image-recompress",
+                        f"{_kb(original)} → {_kb(final)}",
+                    )
+                # Maximal mode: stop once size stops improving.
+                if maximal and prev_size is not None and s >= prev_size:
+                    break
+                prev_size = s
 
         # --- Step 3: best-effort fallback ------------------------------------
         _finalize(best_path, output_path)
@@ -237,7 +316,7 @@ def compress_pdf(input_path, output_path, target_bytes=None,
             output_path, final, met,
             best_method if met else "best-effort",
             f"{_kb(original)} → {_kb(final)} "
-            f"(minim posibil, țintă {_kb(target_bytes)})",
+            f"(best effort, target {_kb(target_bytes)})",
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
