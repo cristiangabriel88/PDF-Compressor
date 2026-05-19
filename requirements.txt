@@ -1,0 +1,6 @@
+PyMuPDF>=1.23
+pikepdf>=8
+Pillow>=10
+tkinterdnd2>=0.4
+sv-ttk>=2.6
+pyinstaller>=6
